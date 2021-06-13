@@ -22,6 +22,8 @@ class Parameters():
         # in MHz
         freq_table = N.arange(freq_min,freq_max,dfreq)
         self.freq_table = freq_table
+        self.nu_ref=Para['nu_ref']
+        self.P_HILAT = Para['P_HILAT']
         #self.xs_table = 2*(c_light/freq_table)**2
         self.xi = float(Para['xi'])
         self.beta = float(Para['beta'])
@@ -32,6 +34,10 @@ class Parameters():
         self.nlms = int((self.lmax + 2) * (self.lmax + 1) / 2)
         sigma_in = hp.fitsfunc.read_map(self.Path_Fara_width)
         spec_in = hp.fitsfunc.read_map(self.Path_Spec_ind)
+        para.spec_in=spec_in
+        self.haslam_map = hp.fitsfunc.read_map(config['PATH']['haslam_map'])
+        self.haslam_nside = Para['haslam_nside']
+        self.haslam_freq = Para['haslam_freq']
         self.sig_max = N.max(sigma_in)
         self.sig_min = N.min(sigma_in)
     def input_maps(self):
@@ -153,6 +159,7 @@ def apply_mask(rlos, cube, sigma_map):
 def generate_freq_maps(para, rlos, spec_map, cube):
     npsi=rlos.n
     npix=para.npix
+    nu_ref=para.nu_ref
     psiConjVec=rlos.xn
     freqVecMHz=para.freq_table
     xNeededVec=1.8e5/freqVecMHz**2
@@ -163,14 +170,37 @@ def generate_freq_maps(para, rlos, spec_map, cube):
     #aux=fs[:, N.newaxis]**spec_map
     #freq_maps = aux*cs(xs)
     nfreq=len(freqVecMHz)
-    freq_maps=N.zeros((nfreq,npix),dtype=complex) 
+    freq_maps=N.zeros((nfreq,npix),dtype=complex)
+    ref_map=N.zeros((npix,),dtype=complex)
+    x_ref = 1.8e5/nu_ref**2
     for ipix in range(npix): 
        jpsiVec=cube[:,ipix]
        jxVec  =N.fft.fft(jpsiVec)
        mySpline=CubicSpline(psiConjVec[0:int(npsi/2)], jxVec[0:int(npsi/2)],extrapolate=False)
+       ref_map[ipix]=mySpline(x_ref)
        fVals=mySpline(xNeededVec)
-       freq_maps[:,ipix]=fVals*((freqVecMHz/300.)**spec_map[ipix])
-    return(freq_maps)
+       freq_maps[:,ipix]=fVals*((freqVecMHz/nu_ref)**spec_map[ipix])
+    return(ref_map,freq_maps)
+    
+def do_normalization(freq_maps,para,ref_map):
+    haslam_map = para.haslam_map
+    npix_strip,pixlist=query_strip(512, 0, 20.*M.pi/180.)
+    P_HILAT = para.P_HILAT
+    t2mean_hilat_hifreq=0.
+    for i in N.arange(int(npix_strip)):
+        ipix=pixlist[i]
+        tmp = haslam_map[ipix]*1000
+        tmp *= (23000./408.)**para.spec_in[ipix]
+        t2mean_hilat_hifreq+=tmp*tmp
+    t2mean_hilat_hifreq/=npix_strip
+    npix_strip_ref,pixlist_ref=query_strip(para.Nside, 0, 20.*M.pi/180.)
+    normalization=0.
+    for i in N.arange(int(npix_strip_ref)):
+        normalization+=(ref_map.real)**2+(ref_map.imag)**2
+    normalization/=npix_strip_ref
+    normalization=N.sqrt(P_HILAT**2/(1-P_HILAT**2)*(t2mean_hilat_hifreq/normalization))
+    freq_maps*=normalization
+    return
     
 def get_x_and_frequency_slices(para,rlos,spec_map,cube):
     npsi=rlos.n
@@ -204,3 +234,59 @@ def get_x_and_frequency_slices(para,rlos,spec_map,cube):
     return(freq_maps,x_maps)
 
 
+#The functions below are translated from similar functions used in CRIME (intensitymapping.physics.ox.ac.uk/CRIME.html)
+
+def query_ring_num(Nside, z):
+    #Returns ring index for normalized height z
+    iring = int(Nside*(2-1.5*z)+0.5)
+    if z>0.66666666:
+        iring= int(nside*N.sqrt(3*(1-z))+0.5)
+        if iring==0:
+            iring=1
+    if z<-0.66666666:
+        iring= int(nside*N.sqrt(3*(1+z))+0.5)
+        if iring==0:
+            iring=1
+        iring=4*nside-iring
+    return iring
+
+def get_ring_limits(nside,iz):
+    npix=12*nside*nside
+    ncap=2*nside*(nside-1)
+    if (iz>=nside) and (iz<=3*nside):
+        ir=iz-nside+1
+        ipix1=ncap+4*nside*(ir-1)
+        ipix2=ipix1+4*nside-1
+    elif iz<nside:
+        ir=iz
+        ipix1=2*ir*(ir-1)
+        ipix2=ipix1+4*ir-1
+    else:
+        ir=4*nside-iz
+        ipix1=npix-2*ir*(ir+1)
+        ipix2=ipix1+4*ir-1
+    return ipix1, ipix2
+
+def query_strip(nside, theta1, theta2):
+    z_hi=M.cos(theta1)
+    z_lo=M.cos(theta2)
+    if theta2<=theta1 or theta1<0 or theta2<0 or theta1>M.pi or theta2>M.pi:
+        print("Wrong strip boundaries\n")
+        exit()
+    irmin=query_ring_num(nside,z_hi)
+    irmax=query_ring_num(nside,z_lo)
+    npix_in_strip=0.
+    for iz in N.arange(irmin,irmax+0.1):
+        ipix1,ipix2=get_ring_limits(nside,iz)
+        npix_in_strip+=ipix2-ipix1+1
+    #Count number of pixels in strip
+    pixlist=N.zeros(npix_in_strip)
+    i_list=0.
+    for iz in N.arange(irmin,irmax+1):
+        ipix1,ipix2=get_ring_limits(nside,iz)
+        for ip in N.arange(ipix1,ipix2+0.1):
+            pixlist[i_list]=ip
+            i_list+=1
+    return npix_in_strip, pixlist
+    
+    
